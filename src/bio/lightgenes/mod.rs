@@ -93,10 +93,11 @@ pub struct LedDriver {
     resource_grant: ResourceGrant,
     // the LED count, kept so a pattern switch can re-send the FIFO1 handshake
     led_count: u8,
-    // clock/config used at init, needed to re-init the core on a pattern switch
     config: CoreConfig,
     // which animation is currently loaded on the BIO core
     pattern: PatternKind,
+    // current LED brightness 0..255, kept so a pattern switch re-sends it
+    brightness: u8,
 }
 
 impl Resources for LedDriver {
@@ -127,6 +128,7 @@ impl LedDriver {
         led_count: u8,
         io_mode: Option<IoConfigMode>,
         initial_pattern: PatternKind,
+        initial_brightness: u8,
     ) -> Result<Self, BioError> {
         let mut bio_ss = Bio::new();
         // claim core resource and initialize it
@@ -173,6 +175,8 @@ impl LedDriver {
 
         tx.csr.wo(utralib::utra::bio_bdma::SFR_TXF1, bio_pin.as_u32());
         tx.csr.wo(utralib::utra::bio_bdma::SFR_TXF1, led_count as u32);
+        // third handshake word: initial brightness (0..255)
+        tx.csr.wo(utralib::utra::bio_bdma::SFR_TXF1, initial_brightness as u32);
 
         Ok(Self {
             bio_ss,
@@ -186,6 +190,7 @@ impl LedDriver {
             led_count,
             config,
             pattern: initial_pattern,
+            brightness: initial_brightness,
         })
     }
 
@@ -228,9 +233,29 @@ impl LedDriver {
         // Re-send the configuration handshake the new program is waiting on.
         self.tx.csr.wo(utralib::utra::bio_bdma::SFR_TXF1, self.bio_pin.as_u32());
         self.tx.csr.wo(utralib::utra::bio_bdma::SFR_TXF1, self.led_count as u32);
+        // third handshake word: current brightness, so the new pattern starts
+        // at the same level the user last selected.
+        self.tx.csr.wo(utralib::utra::bio_bdma::SFR_TXF1, self.brightness as u32);
 
         self.pattern = pattern;
         Ok(())
+    }
+
+    /// Current brightness, 0..255.
+    #[allow(dead_code)]
+    pub fn brightness(&self) -> u8 { self.brightness }
+
+    /// Update the running pattern's brightness (0..255) at runtime.
+    ///
+    /// Sends a brightness-update word to the BIO program over FIFO1, tagged
+    /// with bit 30 so the pattern's drain loop recognizes it (bit 31 is the
+    /// pause/control tag; plain pin/count values have neither high bit set).
+    pub fn set_brightness(&mut self, level: u8) {
+        self.brightness = level;
+        let word: u32 = 0x4000_0000 | (level as u32 & 0xFF);
+        // Don't overflow the FIFO; wait for room if needed.
+        while self.tx.csr.rf(utralib::utra::bio_bdma::SFR_FLEVEL_PCLK_REGFIFO_LEVEL1) > 7 {}
+        self.tx.csr.wo(utralib::utra::bio_bdma::SFR_TXF1, word);
     }
 
     /// Move to the next pattern in `PATTERN_ORDER`, wrapping around.

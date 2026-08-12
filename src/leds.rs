@@ -30,12 +30,17 @@ pub enum LedCtlOp {
     /// Go back to the previous pattern in the ordered list.
     Prev = 1,
     Invalid = 2,
+    /// Set the running pattern to a specific `PatternKind` discriminant,
+    /// passed in scalar arg1. Used by the easter egg to force Rainbow.
+    SetPattern = 3,
+    /// Set LED brightness 0..255, passed in scalar arg1.
+    SetBrightness = 4,
     /// Blocking scalar sent by the BIO server on `BioOp::PrepFreqChange`
     /// (clock transitions) to pause rendering while the clock changes. We
     /// must reply so the blocking caller unblocks; we otherwise do nothing.
     /// See `bao1x-hal-service/src/servers/bio.rs:136-140`, which sends
     /// `Message::new_blocking_scalar(128, ...)`. This is a fixed protocol
-    /// opcode and must not collide with `Next`/`Prev`/`Invalid`.
+    /// opcode and must not collide with the opcodes above.
     Pause = 128,
 }
 
@@ -56,9 +61,11 @@ fn leds() {
     let sid = xns.register_name(LEDS_CTL_SERVER, None).unwrap();
 
     let initial_pattern = PatternKind::BrRunner;
+    // Default to full brightness (matches "currently its in the max").
+    let initial_brightness: u8 = 255;
     log::info!("starting LED service with pattern {:?}", initial_pattern);
 
-    let mut driver = LedDriver::new(u5::new(LED_PIN), LED_COUNT, None, initial_pattern)
+    let mut driver = LedDriver::new(u5::new(LED_PIN), LED_COUNT, None, initial_pattern, initial_brightness)
         .expect("couldn't init BIO LED driver");
     log::info!("LedDriver::new OK, pattern running");
 
@@ -78,6 +85,21 @@ fn leds() {
             LedCtlOp::Prev => {
                 if let Err(e) = driver.prev_pattern() {
                     log::error!("prev pattern failed: {:?}", e);
+                }
+            }
+            LedCtlOp::SetPattern => {
+                if let Some(scalar) = msg_opt.as_ref().unwrap().body.scalar_message() {
+                    if let Some(p) = PatternKind::from_u32(scalar.arg1 as u32) {
+                        if let Err(e) = driver.set_pattern(p) {
+                            log::error!("set pattern failed: {:?}", e);
+                        }
+                    }
+                }
+            }
+            LedCtlOp::SetBrightness => {
+                if let Some(scalar) = msg_opt.as_ref().unwrap().body.scalar_message() {
+                    let level = (scalar.arg1 & 0xFF) as u8;
+                    driver.set_brightness(level);
                 }
             }
             LedCtlOp::Pause => {

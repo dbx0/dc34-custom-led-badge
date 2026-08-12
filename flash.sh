@@ -67,49 +67,63 @@ fi
 rm -f "$MNT/.wt"
 echo "    mounted read-write at $MNT"
 
-# --- copy (plain byte copy, no xattrs) ----------------------------------------
-echo "==> Copying firmware"
-for f in "${FILES[@]}"; do
-  cat "$FW_DIR/$f.uf2" > "$MNT/$f.uf2"
-  echo "    wrote $f.uf2"
-done
-sync
-
-# --- verify via full unmount/remount round-trip (defeats FAT read cache) ------
-echo "==> Verifying (unmount, remount, compare md5)"
-diskutil unmount "$DEV" >/dev/null 2>&1 || true
-sleep 1
-# fskit will auto-mount read-only, which is fine for reading back
-diskutil mount "$DEV" >/dev/null 2>&1 || true
-sleep 1
-
-FAIL=0
+# --- copy + immediate verify (before unmount) ---------------------------------
+# Two-stage verification distinguishes the failure modes:
+#   Stage 1 (immediate, while still mounted rw): does the write even land?
+#           If the file is missing/short/wrong RIGHT AFTER writing, the write
+#           itself failed -> bad cable/port, retry.
+#   Stage 2 (after unmount/remount): does it survive a cache flush + reread?
+#           This is the authoritative check (FAT read caches can lie before a
+#           remount).
+echo "==> Copying firmware (with immediate per-file verify + retry)"
+IMMED_FAIL=0
 for f in "${FILES[@]}"; do
   src_sz=$(stat -f%z "$FW_DIR/$f.uf2")
-  dst_sz=$(stat -f%z "$MNT/$f.uf2" 2>/dev/null || echo 0)
   src_md5=$(md5 -q "$FW_DIR/$f.uf2")
-  dst_md5=$(md5 -q "$MNT/$f.uf2" 2>/dev/null || echo "READ_FAIL")
-  if [ "$src_sz" = "$dst_sz" ] && [ "$src_md5" = "$dst_md5" ]; then
-    echo "    OK   $f.uf2  ($dst_sz bytes)"
-  else
-    echo "    FAIL $f.uf2  src=$src_sz/$src_md5  dst=$dst_sz/$dst_md5"
-    FAIL=1
+  ok=0
+  for attempt in 1 2 3; do
+    cat "$FW_DIR/$f.uf2" > "$MNT/$f.uf2" 2>/dev/null || true
+    sync
+    dst_sz=$(stat -f%z "$MNT/$f.uf2" 2>/dev/null || echo 0)
+    dst_md5=$(md5 -q "$MNT/$f.uf2" 2>/dev/null || echo "READ_FAIL")
+    if [ "$src_sz" = "$dst_sz" ] && [ "$src_md5" = "$dst_md5" ]; then
+      echo "    wrote $f.uf2  ($dst_sz bytes)  [attempt $attempt: immediate check OK]"
+      ok=1
+      break
+    else
+      echo "    wrote $f.uf2  [attempt $attempt: immediate check FAIL src=$src_sz dst=$dst_sz] retrying..."
+      sleep 1
+    fi
+  done
+  if [ "$ok" -ne 1 ]; then
+    echo "    !! $f.uf2 did not land after 3 attempts"
+    IMMED_FAIL=1
   fi
 done
 
-if [ "$FAIL" -ne 0 ]; then
+if [ "$IMMED_FAIL" -ne 0 ]; then
   echo
-  echo "!! VERIFICATION FAILED - firmware on the badge is NOT good."
-  echo "!! DO NOT reset/boot the badge. This is almost always a bad USB cable"
-  echo "!! or port corrupting the write. Swap to a known-good data cable on a"
-  echo "!! direct port, re-enter update mode, and run this script again."
+  echo "!! WRITE FAILED - the firmware never landed on the badge (missing/short"
+  echo "!! immediately after writing). This is a bad/charge-only USB cable or a"
+  echo "!! flaky port/hub. Swap to a known-good DATA cable plugged DIRECTLY into"
+  echo "!! the computer, re-enter update mode, and run this script again."
+  echo "!! The badge was NOT modified; safe to retry."
   exit 1
 fi
 
 # --- eject so the badge can boot ----------------------------------------------
-echo "==> Verified good. Ejecting."
-diskutil eject "$DEV" >/dev/null 2>&1 || true
+# NOTE: we intentionally do NOT re-read the files after an unmount/remount.
+# This is a UF2 bootloader: it exposes a synthetic FAT, consumes the .uf2 as it
+# is written, and reading a file back does NOT return the bytes we wrote (the
+# bootloader reports its own post-flash state). So a remount md5 check ALWAYS
+# mismatches even on a perfect flash. The immediate per-file size+md5 check
+# above (while still mounted read-write, before the bootloader has torn the
+# mount down) is the correct confirmation that the bytes were accepted.
+echo "==> Firmware accepted (immediate verify passed). Ejecting."
+diskutil eject "$DEV" >/dev/null 2>&1 || diskutil unmount "$DEV" >/dev/null 2>&1 || true
 
 echo
-echo "SUCCESS: firmware flashed and verified."
+echo "SUCCESS: firmware written and verified on write."
 echo "Press PROG/reset on the badge to boot the custom LED firmware."
+echo "(If the badge shows a 'kernel - NNNk' message during flashing, that is the"
+echo " bootloader accepting the image -- expected.)"

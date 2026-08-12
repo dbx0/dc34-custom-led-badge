@@ -1,10 +1,15 @@
-mod bio;
 mod background;
+mod bio;
 mod leds;
+mod nyan;
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use num_derive::FromPrimitive;
 use ux_api::service::gfx::Gfx;
 
+use crate::bio::PatternKind;
 use crate::leds::{LedCtlOp, LEDS_CTL_SERVER};
 
 /// Server name this app registers so the gfx subsystem can route filtered
@@ -40,15 +45,20 @@ enum LedAppOp {
 /// each step, and log a screen_size() probe (a *blocking* round-trip that
 /// proves the gfx server is actually servicing us).
 fn draw_background(gfx: &Gfx) {
-    // Defensively clear any lingering dry_run state left by another gfx client;
-    // while dry_run is set, Flush is a no-op and nothing ever reaches the panel.
+    draw_frame(gfx, &background::BITMAP);
+}
+
+/// Draw an arbitrary 128x128 `[u32; 512]` frame to the panel. Shares the same
+/// defensive dry_run/clear/bitmap/flush sequence as draw_background (see its
+/// doc comment for why dry_run is cleared first).
+fn draw_frame(gfx: &Gfx, frame: &[u32]) {
     if let Err(e) = gfx.dry_run(false) {
         log::warn!("gfx.dry_run(false) err: {:?}", e);
     }
     if let Err(e) = gfx.clear() {
         log::warn!("gfx.clear err: {:?}", e);
     }
-    if let Err(e) = gfx.bitmap(&background::BITMAP, None, None) {
+    if let Err(e) = gfx.bitmap(frame, None, None) {
         log::warn!("gfx.bitmap err: {:?}", e);
     }
     if let Err(e) = gfx.flush() {
@@ -188,41 +198,72 @@ fn main() {
         }
     });
 
-    // Candidate characters that should map to prev / next / camera. The real
-    // button->char mapping on this hardware is not documented, so we accept a
-    // set of plausible codes so at least one physical button works for each
-    // action.
-    //   button1 (prev):  '←', '↑', 'a', '1'
-    //   button3 (next):  '→', 'd', '3'
-    //   button2/PROG (camera): '🔥'
-    //
-    // NOTE: the DOWN arrow '↓' is intentionally NOT in NEXT_KEYS: it is
-    // dedicated to the press-and-hold power-off gesture (see below). A single
-    // '↓' tap does nothing; you must HOLD '↓' for ~1.5-2s to power off.
-    const PREV_KEYS: &[char] = &['←', '↑', 'a', '1'];
+    // ---- Easter egg: nyan animation ------------------------------------------
+    // When `nyan_active` is set, a dedicated player thread cycles the baked
+    // nyan.gif frames (~10 fps) onto the display. It uses its OWN gfx
+    // connection so it doesn't share `gfx` with the main thread. While active,
+    // the normal background redraws (ticker + keypress) are suppressed so they
+    // don't fight the animation.
+    let nyan_active = Arc::new(AtomicBool::new(false));
+    {
+        let nyan_active = nyan_active.clone();
+        let xns_nyan = xous_names::XousNames::new().unwrap();
+        std::thread::spawn(move || {
+            let tt = ticktimer::Ticktimer::new().unwrap();
+            let gfx = Gfx::new(&xns_nyan).unwrap();
+            let mut frame = 0usize;
+            loop {
+                if nyan_active.load(Ordering::Relaxed) {
+                    draw_frame(&gfx, &nyan::FRAMES[frame]);
+                    frame = (frame + 1) % nyan::FRAME_COUNT;
+                    tt.sleep_ms(100).ok(); // ~10 fps, matches the gif's 100ms/frame
+                } else {
+                    frame = 0;
+                    tt.sleep_ms(150).ok();
+                }
+            }
+        });
+    }
+
+    // ---- Button mapping -------------------------------------------------------
+    // The physical button->char mapping is not documented, so we accept a set
+    // of plausible codes per action.
+    //   LEFT  = previous pattern:  '←', 'a', '1'
+    //   RIGHT = next pattern:      '→', 'd', '3'
+    //   UP    = brighter:          '↑'
+    //   DOWN  = dimmer:            '↓'
+    //   PROG  = camera:            '🔥'
+    const PREV_KEYS: &[char] = &['←', 'a', '1'];
     const NEXT_KEYS: &[char] = &['→', 'd', '3'];
+    const UP_KEY: char = '↑';
+    const DOWN_KEY: char = '↓';
     const CAMERA_KEY: char = '🔥';
 
-    // ---- Press-and-hold power-off configuration -------------------------------
-    // The DOWN arrow auto-repeats when physically held: holding it delivers a
-    // stream of '↓' KeyPress events tens of ms apart. We detect a genuine hold
-    // (as opposed to a fast double-tap) by requiring BOTH:
-    //   1. a run of at least POWER_OFF_HOLD_COUNT consecutive '↓' repeats where
-    //      each successive repeat arrives within POWER_OFF_REPEAT_GAP_MS of the
-    //      previous one (any longer gap, or any other key, resets the run), AND
-    //   2. at least POWER_OFF_HOLD_MS of wall-clock time elapsed since the first
-    //      '↓' in that run.
-    // The wall-time gate is the real "must hold ~1.5s" guarantee; the repeat
-    // count guards against a single stray event tripping the timer math.
-    const POWER_OFF_KEY: char = '↓';
-    const POWER_OFF_HOLD_COUNT: u32 = 10;
-    const POWER_OFF_REPEAT_GAP_MS: u64 = 400;
-    const POWER_OFF_HOLD_MS: u64 = 1500;
+    // ---- Brightness -----------------------------------------------------------
+    // 10 steps of 10%. Minimum floor is 10% (never fully off via dimming).
+    // Values are 0..255; 10% ≈ 26, 100% = 255.
+    const BRIGHTNESS_MIN: u8 = 26; // ~10%
+    const BRIGHTNESS_MAX: u8 = 255; // 100%
+    const BRIGHTNESS_STEP: u8 = 26; // ~10% per press
+    let mut brightness: u8 = BRIGHTNESS_MAX; // starts at max
 
-    // Hold-tracking state for the power-off gesture.
-    let mut down_hold_count: u32 = 0;
-    let mut down_hold_first_ms: u64 = 0;
-    let mut down_hold_last_ms: u64 = 0;
+    // ---- Hold gestures (auto-repeat based) ------------------------------------
+    // Held arrow keys auto-repeat, delivering a stream of the same char tens of
+    // ms apart. We track a per-key streak: consecutive repeats within
+    // HOLD_REPEAT_GAP_MS extend it; any gap or different key resets it. Elapsed
+    // wall-time since the streak start is the real "held for N seconds" gate.
+    const HOLD_REPEAT_GAP_MS: u64 = 400;
+    // DOWN held while ALREADY at minimum brightness for this long => power off.
+    const POWEROFF_HOLD_MS: u64 = 3000;
+    // UP held while ALREADY at maximum brightness for this long => easter egg.
+    const EASTER_HOLD_MS: u64 = 10000;
+
+    // Streak state (shared for whichever key is currently being held).
+    let mut hold_key: char = '\u{0000}';
+    let mut hold_first_ms: u64 = 0;
+    let mut hold_last_ms: u64 = 0;
+    // Latches so the poweroff / easter actions fire once per sustained hold.
+    let mut easter_active = false;
 
     let mut msg_opt = None;
     loop {
@@ -238,88 +279,116 @@ fn main() {
                     let k = char::from_u32(scalar.arg1 as u32).unwrap_or('\u{0000}');
                     log::info!("key {:#x} -> {:?}", scalar.arg1, k);
 
-                    // ---- Press-and-hold power-off detection ------------------
-                    // Hold DOWN ('↓') ~1.5-2s to power off. The key auto-repeats
-                    // while held, so we count consecutive fast repeats and gate
-                    // on elapsed wall-time. Any other key breaks the streak.
-                    if k == POWER_OFF_KEY {
-                        let now = tt.elapsed_ms();
-                        if down_hold_count > 0
-                            && now.saturating_sub(down_hold_last_ms) <= POWER_OFF_REPEAT_GAP_MS
-                        {
-                            // Continuing an existing hold streak.
-                            down_hold_count += 1;
-                        } else {
-                            // Start (or restart) a hold streak.
-                            down_hold_count = 1;
-                            down_hold_first_ms = now;
-                        }
-                        down_hold_last_ms = now;
+                    let now = tt.elapsed_ms();
+                    // Maintain the hold streak for the current key.
+                    if k == hold_key && now.saturating_sub(hold_last_ms) <= HOLD_REPEAT_GAP_MS {
+                        // continuing an existing hold of the same key
+                    } else {
+                        hold_key = k;
+                        hold_first_ms = now;
+                    }
+                    hold_last_ms = now;
+                    let held_ms = now.saturating_sub(hold_first_ms);
 
-                        let held_ms = now.saturating_sub(down_hold_first_ms);
-                        if down_hold_count >= POWER_OFF_HOLD_COUNT && held_ms >= POWER_OFF_HOLD_MS {
-                            log::info!(
-                                "power off requested (hold), shutting down (count={}, held={}ms)",
-                                down_hold_count,
-                                held_ms
-                            );
-                            // Blank the screen as a "powering off" indicator.
-                            gfx.clear().ok();
-                            gfx.flush().ok();
-                            // Wait for the user to release the button before
-                            // arming deep sleep. deep_sleep() wakes on ANY
-                            // button press; if we sleep while DOWN is still
-                            // held (auto-repeat), the held key is seen as an
-                            // immediate wake event and the device restarts.
-                            // Stock firmware delayed ~5s; 3s is a comfortable
-                            // UX compromise that outlasts a normal hold+release.
-                            log::info!(
-                                "power off: waiting 3s for button release before sleep"
-                            );
-                            tt.sleep_ms(3000).ok();
-                            log::info!("power off: sending DeepSleep to susres server");
-                            // The susres server (in bao1x-hal-service) owns the
-                            // ClockManagerImpl and its deep_sleep(). We cannot
-                            // construct ClockManagerImpl here (its CSR pages are
-                            // already mapped by that process -> MemoryInUse).
-                            // Instead ask susres to power down, exactly as the
-                            // stock power manager did.
-                            use num_traits::ToPrimitive;
-                            let xns2 = xous_names::XousNames::new().unwrap();
-                            if let Ok(conn) = xns2
-                                .request_connection_blocking(susres::api::SERVER_NAME_SUSRES)
-                            {
-                                xous::send_message(
-                                    conn,
+                    if k == UP_KEY {
+                        if brightness >= BRIGHTNESS_MAX {
+                            // Already at max. Sustained hold => easter egg.
+                            brightness = BRIGHTNESS_MAX;
+                            if !easter_active && held_ms >= EASTER_HOLD_MS {
+                                easter_active = true;
+                                log::info!("easter egg: rainbow + nyan (held UP at max {}ms)", held_ms);
+                                // Force the Rainbow pattern.
+                                xous::try_send_message(
+                                    led_ctl,
                                     xous::Message::new_scalar(
-                                        susres::api::Opcode::PlatformSpecific
-                                            .to_usize()
-                                            .unwrap(),
-                                        bao1x_hal::clocks::ClockOp::DeepSleep
-                                            .to_usize()
-                                            .unwrap(),
+                                        LedCtlOp::SetPattern as usize,
+                                        PatternKind::Rainbow as u32 as usize,
                                         0,
                                         0,
                                         0,
                                     ),
                                 )
                                 .ok();
+                                // Start the nyan animation (player thread owns gfx).
+                                nyan_active.store(true, Ordering::Relaxed);
                             }
-                            // Device powers down; nothing past here runs. Loop
-                            // just in case the message returned for some reason,
-                            // so we don't fall through to more key handling with
-                            // a half-shutdown state.
-                            loop {
-                                tt.sleep_ms(1000).ok();
+                        } else {
+                            brightness = brightness.saturating_add(BRIGHTNESS_STEP).min(BRIGHTNESS_MAX);
+                            log::info!("brightness up -> {}", brightness);
+                            xous::try_send_message(
+                                led_ctl,
+                                xous::Message::new_scalar(
+                                    LedCtlOp::SetBrightness as usize,
+                                    brightness as usize,
+                                    0,
+                                    0,
+                                    0,
+                                ),
+                            )
+                            .ok();
+                            if !nyan_active.load(Ordering::Relaxed) {
+                                draw_background(&gfx);
                             }
                         }
-                        // While detecting a hold, keep redrawing the background so
-                        // the badge persists between repeats.
-                        draw_background(&gfx);
+                    } else if k == DOWN_KEY {
+                        if brightness <= BRIGHTNESS_MIN {
+                            // Already at min. Sustained hold => power off.
+                            brightness = BRIGHTNESS_MIN;
+                            if held_ms >= POWEROFF_HOLD_MS {
+                                log::info!("power off (held DOWN at min {}ms)", held_ms);
+                                nyan_active.store(false, Ordering::Relaxed);
+                                gfx.clear().ok();
+                                gfx.flush().ok();
+                                // Wait for button release so the held key isn't
+                                // seen as an immediate wake source by deep_sleep
+                                // (which wakes on any button).
+                                log::info!("power off: waiting 3s for button release before sleep");
+                                tt.sleep_ms(3000).ok();
+                                log::info!("power off: sending DeepSleep to susres server");
+                                use num_traits::ToPrimitive;
+                                let xns2 = xous_names::XousNames::new().unwrap();
+                                if let Ok(conn) = xns2
+                                    .request_connection_blocking(susres::api::SERVER_NAME_SUSRES)
+                                {
+                                    xous::send_message(
+                                        conn,
+                                        xous::Message::new_scalar(
+                                            susres::api::Opcode::PlatformSpecific.to_usize().unwrap(),
+                                            bao1x_hal::clocks::ClockOp::DeepSleep.to_usize().unwrap(),
+                                            0,
+                                            0,
+                                            0,
+                                        ),
+                                    )
+                                    .ok();
+                                }
+                                loop {
+                                    tt.sleep_ms(1000).ok();
+                                }
+                            }
+                        } else {
+                            brightness = brightness.saturating_sub(BRIGHTNESS_STEP).max(BRIGHTNESS_MIN);
+                            log::info!("brightness down -> {}", brightness);
+                            xous::try_send_message(
+                                led_ctl,
+                                xous::Message::new_scalar(
+                                    LedCtlOp::SetBrightness as usize,
+                                    brightness as usize,
+                                    0,
+                                    0,
+                                    0,
+                                ),
+                            )
+                            .ok();
+                            if !nyan_active.load(Ordering::Relaxed) {
+                                draw_background(&gfx);
+                            }
+                        }
                     } else if k == CAMERA_KEY {
-                        // Any non-'↓' key breaks the power-off hold streak.
-                        down_hold_count = 0;
                         // Camera mode: acquire a QR code, then redraw the badge.
+                        // Cancel the easter egg / nyan animation.
+                        nyan_active.store(false, Ordering::Relaxed);
+                        easter_active = false;
                         log::info!("entering camera mode");
                         match gfx.acquire_qr() {
                             Ok(qr) => log::info!("camera returned: {:?}", qr.content),
@@ -327,30 +396,50 @@ fn main() {
                         }
                         draw_background(&gfx);
                     } else if PREV_KEYS.contains(&k) {
-                        down_hold_count = 0;
+                        // Left = previous pattern. Cancel the easter egg so the
+                        // static background returns.
+                        if nyan_active.swap(false, Ordering::Relaxed) {
+                            easter_active = false;
+                            draw_background(&gfx);
+                        }
                         xous::try_send_message(
                             led_ctl,
                             xous::Message::new_scalar(LedCtlOp::Prev as usize, 0, 0, 0, 0),
                         )
                         .ok();
-                        draw_background(&gfx);
+                        if !nyan_active.load(Ordering::Relaxed) {
+                            draw_background(&gfx);
+                        }
                     } else if NEXT_KEYS.contains(&k) {
-                        down_hold_count = 0;
+                        // Right = next pattern. Cancel the easter egg.
+                        if nyan_active.swap(false, Ordering::Relaxed) {
+                            easter_active = false;
+                            draw_background(&gfx);
+                        }
                         xous::try_send_message(
                             led_ctl,
                             xous::Message::new_scalar(LedCtlOp::Next as usize, 0, 0, 0, 0),
                         )
                         .ok();
-                        draw_background(&gfx);
+                        if !nyan_active.load(Ordering::Relaxed) {
+                            draw_background(&gfx);
+                        }
                     } else {
-                        down_hold_count = 0;
-                        // Unknown key; still redraw so the background persists.
-                        draw_background(&gfx);
+                        // Unknown key; keep the display persistent unless nyan
+                        // is animating.
+                        if !nyan_active.load(Ordering::Relaxed) {
+                            draw_background(&gfx);
+                        }
                     }
                 }
             }
             LedAppOp::Redraw => {
-                draw_background(&gfx);
+                // The periodic ticker only refreshes the static background when
+                // the nyan animation is not running (the player owns the screen
+                // while active).
+                if !nyan_active.load(Ordering::Relaxed) {
+                    draw_background(&gfx);
+                }
             }
             LedAppOp::Invalid => {
                 log::error!("Invalid LED app operation");
