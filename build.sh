@@ -4,12 +4,14 @@
 # Produces: dc34-leds/firmware/{loader,xous,swap}.uf2
 #
 # Usage:
-#   ./build.sh                       # build with the current background image
-#   ./build.sh --image path/to.png   # convert + use a custom background image
-#   ./build.sh -i path/to.png
+#   ./build.sh                        # build with the current background
+#   ./build.sh --image path/to.png    # still background from an image
+#   ./build.sh --bg-gif path/to.gif   # animated background from a GIF
+#   ./build.sh -i path/to.png  /  -g path/to.gif
 #
-# The custom image is fit to 128x128, converted to 1-bit black & white, and
-# baked in as the boot/background bitmap (dc34-leds/src/background.rs).
+# --image: the image is fit to 128x128, 1-bit B&W, baked as a single-frame
+#   background. --bg-gif: each GIF frame is fit to 128x128, 1-bit B&W, baked as
+#   an animated background (~10fps). Both write dc34-leds/src/background.rs.
 #
 # Run from anywhere; paths are resolved relative to this script.
 set -euo pipefail
@@ -22,6 +24,7 @@ TARGET="riscv32imac-unknown-xous-elf"
 APP_ELF="$APP_DIR/target/$TARGET/release/dc34-leds"
 BG_RS="$APP_DIR/src/background.rs"
 IMG2BG="$APP_DIR/img2background.py"
+GIF2FRAMES="$APP_DIR/gif2frames.py"
 
 # xous-core dev-HEAD rev that everything is pinned to (used as the CI semver
 # fallback so image signing doesn't require a git tag).
@@ -29,6 +32,7 @@ XOUS_REV="5d5bbbfa95c0dcef26fe1fe9b496b7f6f31d191b"
 
 # --- parse args ---------------------------------------------------------------
 CUSTOM_IMAGE=""
+CUSTOM_GIF=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -i|--image)
@@ -36,14 +40,23 @@ while [ $# -gt 0 ]; do
       [ -n "$CUSTOM_IMAGE" ] || { echo "ERROR: $1 requires a path argument"; exit 1; }
       shift 2
       ;;
+    -g|--bg-gif)
+      CUSTOM_GIF="${2:-}"
+      [ -n "$CUSTOM_GIF" ] || { echo "ERROR: $1 requires a path argument"; exit 1; }
+      shift 2
+      ;;
     -h|--help)
       grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0
       ;;
     *)
-      echo "ERROR: unknown argument '$1' (use --image <path> or --help)"; exit 1
+      echo "ERROR: unknown argument '$1' (use --image <path>, --bg-gif <path>, or --help)"; exit 1
       ;;
   esac
 done
+
+if [ -n "$CUSTOM_IMAGE" ] && [ -n "$CUSTOM_GIF" ]; then
+  echo "ERROR: use only one of --image or --bg-gif"; exit 1
+fi
 
 # --- sanity checks ------------------------------------------------------------
 [ -d "$APP_DIR" ]  || { echo "ERROR: missing $APP_DIR"; exit 1; }
@@ -60,6 +73,19 @@ if [ -n "$CUSTOM_IMAGE" ]; then
   [ -f "$BG_RS.orig" ] || cp "$BG_RS" "$BG_RS.orig"
   python3 "$IMG2BG" "$CUSTOM_IMAGE" "$BG_RS"
   echo "    baked into $BG_RS"
+fi
+
+# --- optional: convert an animated background GIF -----------------------------
+if [ -n "$CUSTOM_GIF" ]; then
+  [ -f "$CUSTOM_GIF" ]    || { echo "ERROR: gif not found: $CUSTOM_GIF"; exit 1; }
+  [ -f "$GIF2FRAMES" ]    || { echo "ERROR: missing converter $GIF2FRAMES"; exit 1; }
+  command -v python3 >/dev/null || { echo "ERROR: python3 not found (needed for gif conversion)"; exit 1; }
+  python3 -c "import PIL" 2>/dev/null || { echo "ERROR: Pillow not installed (pip3 install Pillow)"; exit 1; }
+  echo "==> [0/3] Converting animated background gif: $CUSTOM_GIF"
+  # Back up the existing background once so it's recoverable.
+  [ -f "$BG_RS.orig" ] || cp "$BG_RS" "$BG_RS.orig"
+  python3 "$GIF2FRAMES" "$CUSTOM_GIF" "$BG_RS"
+  echo "    baked animated background into $BG_RS"
 fi
 
 # --- rust toolchain -----------------------------------------------------------

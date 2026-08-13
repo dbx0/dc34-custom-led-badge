@@ -4,7 +4,7 @@ mod leds;
 mod nyan;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use num_derive::FromPrimitive;
 use ux_api::service::gfx::Gfx;
@@ -15,6 +15,12 @@ use crate::leds::{LedCtlOp, LEDS_CTL_SERVER};
 /// Server name this app registers so the gfx subsystem can route filtered
 /// keyboard events to us.
 const SERVER_NAME_LEDS: &str = "_dc34_leds_";
+
+/// Which frame source the background player thread is currently drawing.
+/// SRC_BACKGROUND = normal background (background::FRAMES),
+/// SRC_NYAN = nyan easter egg (nyan::FRAMES).
+const SRC_BACKGROUND: u8 = 0;
+const SRC_NYAN: u8 = 1;
 
 /// Opcodes handled by our main server loop.
 #[derive(Debug, FromPrimitive)]
@@ -27,30 +33,17 @@ enum LedAppOp {
     Invalid = 2,
 }
 
-/// Draw the background bitmap as the full-screen background.
+/// Draw an arbitrary 128x128 `[u32; 512]` frame to the panel.
 ///
 /// bao-video silently *drops* Clear/Flush (returning Ok either way) whenever it
 /// is in `dry_run` mode or has a pending `qr_request` (see
 /// xous-core/services/bao-video/src/main.rs: the `GfxOpcode::Clear` and
 /// `GfxOpcode::Flush` arms are gated on `if qr_request.is_none()` / `if
 /// !dry_run`). The BaosecBitmap arm, by contrast, is *ungated* and always
-/// writes into the framebuffer. That asymmetry is exactly the failure mode for
-/// a persistent white screen: `bitmap()` populates the buffer but the `flush()`
-/// that would push it to the panel is quietly discarded, so the display stays
-/// at the all-`0xFFFF_FFFF` (white) state that bao-video sets at init
-/// (display.init() -> clear() -> draw()).
-///
-/// Since `.ok()` hides that (the calls "succeed"), we defensively clear any
-/// stuck `dry_run` state before drawing, capture and log the real `Result` of
-/// each step, and log a screen_size() probe (a *blocking* round-trip that
-/// proves the gfx server is actually servicing us).
-fn draw_background(gfx: &Gfx) {
-    draw_frame(gfx, &background::BITMAP);
-}
-
-/// Draw an arbitrary 128x128 `[u32; 512]` frame to the panel. Shares the same
-/// defensive dry_run/clear/bitmap/flush sequence as draw_background (see its
-/// doc comment for why dry_run is cleared first).
+/// writes into the framebuffer. That asymmetry is the failure mode for a
+/// persistent white screen: `bitmap()` populates the buffer but the `flush()`
+/// that would push it to the panel is quietly discarded. So we defensively
+/// clear any stuck `dry_run` state before drawing.
 fn draw_frame(gfx: &Gfx, frame: &[u32]) {
     if let Err(e) = gfx.dry_run(false) {
         log::warn!("gfx.dry_run(false) err: {:?}", e);
@@ -143,7 +136,6 @@ fn main() {
     // vault, and so the gfx subsystem can route keyboard events to us.
     let xns = xous_names::XousNames::new().unwrap();
     let sid = xns.register_name(SERVER_NAME_LEDS, None).unwrap();
-    let self_conn = xous::connect(sid).unwrap();
     log::info!("dc34-leds registered server {}, sid {:?}", SERVER_NAME_LEDS, sid);
 
     let tt = ticktimer::Ticktimer::new().unwrap();
@@ -167,11 +159,6 @@ fn main() {
         Err(_) => log::error!("gfx.screen_size panicked (gfx server not servicing?)"),
     }
 
-    // Draw the badge background.
-    log::info!("initial draw_background");
-    draw_background(&gfx);
-    log::info!("initial draw_background done");
-
     // Route filtered keyboard events to our server.
     gfx.register_listener(SERVER_NAME_LEDS, LedAppOp::KeyPress as usize);
 
@@ -184,42 +171,43 @@ fn main() {
     log::info!("led_ctl connected");
     log::info!("dc34-leds connected to LED control server");
 
-    // Spawn a low-frequency redraw ticker so the background survives any
-    // re-blit from other servers. It just pokes our own server.
-    std::thread::spawn(move || {
-        let tt = ticktimer::Ticktimer::new().unwrap();
-        loop {
-            tt.sleep_ms(2000).ok();
-            xous::try_send_message(
-                self_conn,
-                xous::Message::new_scalar(LedAppOp::Redraw as usize, 0, 0, 0, 0),
-            )
-            .ok();
-        }
-    });
-
-    // ---- Easter egg: nyan animation ------------------------------------------
-    // When `nyan_active` is set, a dedicated player thread cycles the baked
-    // nyan.gif frames (~10 fps) onto the display. It uses its OWN gfx
-    // connection so it doesn't share `gfx` with the main thread. While active,
-    // the normal background redraws (ticker + keypress) are suppressed so they
-    // don't fight the animation.
-    let nyan_active = Arc::new(AtomicBool::new(false));
+    // ---- Unified background player -------------------------------------------
+    // A single thread owns the screen and draws whichever frame source is
+    // active: the normal background (background::FRAMES) by default, or the nyan
+    // easter-egg frames (nyan::FRAMES) when selected. It uses its OWN gfx
+    // connection so it doesn't share `gfx` with the main thread.
+    //   - FRAME_COUNT == 1  => still image: draw once, then re-assert at low
+    //     frequency (~1s) so a panel clobber recovers, with no flicker.
+    //   - FRAME_COUNT > 1   => animate at ~10 fps.
+    // The main thread never draws the background anymore; it only flips
+    // `bg_source` and handles keys.
+    let bg_source = Arc::new(AtomicU8::new(SRC_BACKGROUND));
     {
-        let nyan_active = nyan_active.clone();
-        let xns_nyan = xous_names::XousNames::new().unwrap();
+        let bg_source = bg_source.clone();
+        let xns_bg = xous_names::XousNames::new().unwrap();
         std::thread::spawn(move || {
             let tt = ticktimer::Ticktimer::new().unwrap();
-            let gfx = Gfx::new(&xns_nyan).unwrap();
+            let gfx = Gfx::new(&xns_bg).unwrap();
             let mut frame = 0usize;
+            let mut last_src = 0xFFu8;
             loop {
-                if nyan_active.load(Ordering::Relaxed) {
-                    draw_frame(&gfx, &nyan::FRAMES[frame]);
-                    frame = (frame + 1) % nyan::FRAME_COUNT;
-                    tt.sleep_ms(100).ok(); // ~10 fps, matches the gif's 100ms/frame
-                } else {
+                let src = bg_source.load(Ordering::Relaxed);
+                if src != last_src {
                     frame = 0;
-                    tt.sleep_ms(150).ok();
+                    last_src = src;
+                }
+                let (frames, count): (&[[u32; 512]], usize) = if src == SRC_NYAN {
+                    (&nyan::FRAMES, nyan::FRAME_COUNT)
+                } else {
+                    (&background::FRAMES, background::FRAME_COUNT)
+                };
+                if count <= 1 {
+                    draw_frame(&gfx, &frames[0]);
+                    tt.sleep_ms(1000).ok();
+                } else {
+                    draw_frame(&gfx, &frames[frame % count]);
+                    frame = (frame + 1) % count;
+                    tt.sleep_ms(100).ok(); // ~10 fps
                 }
             }
         });
@@ -310,7 +298,7 @@ fn main() {
                                 )
                                 .ok();
                                 // Start the nyan animation (player thread owns gfx).
-                                nyan_active.store(true, Ordering::Relaxed);
+                                bg_source.store(SRC_NYAN, Ordering::Relaxed);
                             }
                         } else {
                             brightness = brightness.saturating_add(BRIGHTNESS_STEP).min(BRIGHTNESS_MAX);
@@ -326,9 +314,6 @@ fn main() {
                                 ),
                             )
                             .ok();
-                            if !nyan_active.load(Ordering::Relaxed) {
-                                draw_background(&gfx);
-                            }
                         }
                     } else if k == DOWN_KEY {
                         if brightness <= BRIGHTNESS_MIN {
@@ -336,7 +321,7 @@ fn main() {
                             brightness = BRIGHTNESS_MIN;
                             if held_ms >= POWEROFF_HOLD_MS {
                                 log::info!("power off (held DOWN at min {}ms)", held_ms);
-                                nyan_active.store(false, Ordering::Relaxed);
+                                bg_source.store(SRC_BACKGROUND, Ordering::Relaxed);
                                 gfx.clear().ok();
                                 gfx.flush().ok();
                                 // Wait for button release so the held key isn't
@@ -380,66 +365,46 @@ fn main() {
                                 ),
                             )
                             .ok();
-                            if !nyan_active.load(Ordering::Relaxed) {
-                                draw_background(&gfx);
-                            }
                         }
                     } else if k == CAMERA_KEY {
-                        // Camera mode: acquire a QR code, then redraw the badge.
-                        // Cancel the easter egg / nyan animation.
-                        nyan_active.store(false, Ordering::Relaxed);
+                        // Camera mode: acquire a QR code, then return to the
+                        // normal background. Cancel the easter egg.
+                        bg_source.store(SRC_BACKGROUND, Ordering::Relaxed);
                         easter_active = false;
                         log::info!("entering camera mode");
                         match gfx.acquire_qr() {
                             Ok(qr) => log::info!("camera returned: {:?}", qr.content),
                             Err(e) => log::warn!("camera acquire_qr failed: {:?}", e),
                         }
-                        draw_background(&gfx);
+                        // The player thread will redraw the background frame.
                     } else if PREV_KEYS.contains(&k) {
                         // Left = previous pattern. Cancel the easter egg so the
-                        // static background returns.
-                        if nyan_active.swap(false, Ordering::Relaxed) {
-                            easter_active = false;
-                            draw_background(&gfx);
-                        }
+                        // normal background returns.
+                        bg_source.store(SRC_BACKGROUND, Ordering::Relaxed);
+                        easter_active = false;
                         xous::try_send_message(
                             led_ctl,
                             xous::Message::new_scalar(LedCtlOp::Prev as usize, 0, 0, 0, 0),
                         )
                         .ok();
-                        if !nyan_active.load(Ordering::Relaxed) {
-                            draw_background(&gfx);
-                        }
                     } else if NEXT_KEYS.contains(&k) {
                         // Right = next pattern. Cancel the easter egg.
-                        if nyan_active.swap(false, Ordering::Relaxed) {
-                            easter_active = false;
-                            draw_background(&gfx);
-                        }
+                        bg_source.store(SRC_BACKGROUND, Ordering::Relaxed);
+                        easter_active = false;
                         xous::try_send_message(
                             led_ctl,
                             xous::Message::new_scalar(LedCtlOp::Next as usize, 0, 0, 0, 0),
                         )
                         .ok();
-                        if !nyan_active.load(Ordering::Relaxed) {
-                            draw_background(&gfx);
-                        }
                     } else {
-                        // Unknown key; keep the display persistent unless nyan
-                        // is animating.
-                        if !nyan_active.load(Ordering::Relaxed) {
-                            draw_background(&gfx);
-                        }
+                        // Unknown key; nothing to do. The player thread keeps
+                        // the display refreshed.
                     }
                 }
             }
             LedAppOp::Redraw => {
-                // The periodic ticker only refreshes the static background when
-                // the nyan animation is not running (the player owns the screen
-                // while active).
-                if !nyan_active.load(Ordering::Relaxed) {
-                    draw_background(&gfx);
-                }
+                // Legacy no-op: the background player thread now owns all
+                // drawing, so there is nothing to do here.
             }
             LedAppOp::Invalid => {
                 log::error!("Invalid LED app operation");

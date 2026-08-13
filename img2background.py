@@ -9,7 +9,7 @@ pngtorust.py used by dc34-vault):
   - bit = 0 for white pixels, 1 for black
   - pack MSB-first into 32-bit words
   - emit words in groups of 4, each group written in reverse order
-  - output `pub const BITMAP: [u32; 512]`
+  - output a single-frame `FRAMES`/`FRAME_COUNT` (N=1) background module
 
 Usage:
   img2background.py <input_image> <output_rust_file>
@@ -57,17 +57,20 @@ def convert(ifile: str, ofile: str) -> None:
 
     with open(ofile, "w") as out:
         out.write("#![cfg_attr(rustfmt, rustfmt_skip)]\n")
-        out.write("pub const BITMAP: [u32; 512] = [\n")
+        out.write("pub const FRAME_COUNT: usize = 1;\n")
+        out.write("pub const FRAMES: [[u32; 512]; 1] = [\n")
+        out.write("  [\n")
         for i in range(512 // 4):
             out.write(
-                "  0x{:08x}, 0x{:08x}, 0x{:08x}, 0x{:08x},\n".format(
+                "    0x{:08x}, 0x{:08x}, 0x{:08x}, 0x{:08x},\n".format(
                     packed[i * 4 + 3],
                     packed[i * 4 + 2],
                     packed[i * 4 + 1],
                     packed[i * 4 + 0],
                 )
             )
-        out.write("\n];\n")
+        out.write("  ],\n")
+        out.write("];\n")
 
 
 def main() -> None:

@@ -50,11 +50,12 @@ cargo xtask install-toolkit   # run inside xous-core, installs the riscv32imac-u
 
 ```bash
 ./build.sh                      # build with the current background
-./build.sh --image logo.png     # convert + bake in a custom background
+./build.sh --image logo.png     # still background from an image
+./build.sh --bg-gif anim.gif    # animated background from a GIF
 ```
 
 Output UF2s land in `dc34-leds/firmware/`. Requires the toolchain from
-[Setup](#setup), plus Python 3 + Pillow if you use `--image`.
+[Setup](#setup), plus Python 3 + Pillow if you use `--image` or `--bg-gif`.
 
 ## Flash
 
@@ -87,8 +88,12 @@ button press / reset.
 
 ## Customizing
 
-- **Background image:** `./build.sh --image your.png` (fit to 128×128, converted
-  to 1-bit black & white). 
+- **Still background:** `./build.sh --image your.png` (fit to 128×128, 1-bit
+  black & white).
+- **Animated background:** `./build.sh --bg-gif your.gif` (each frame fit to
+  128×128, 1-bit; animates at ~10fps). A still image is just a 1-frame
+  background — both bake into `dc34-leds/src/background.rs` as
+  `FRAMES`/`FRAME_COUNT`, and the app animates when there is more than one frame.
 - **Startup pattern:** `initial_pattern` in `dc34-leds/src/leds.rs`.
 - **Pattern order:** `PATTERN_ORDER` in `dc34-leds/src/bio/lightgenes/mod.rs`.
 
